@@ -49,13 +49,14 @@ GPU testleri ekranda pencere açmadan, ekran dışı (offscreen) OpenGL 3.3 ile 
 alır ve nedeni kartta gösterilir. Bilgisayarda gerçek bir GPU yoksa ve sistem yazılımsal
 çizime (llvmpipe vb.) düşerse kartta "yazılımsal" uyarısı çıkar.
 
-### Windows depolama düzeltmesi
+### Depolama testinde önbellek
 
-macOS ve Linux'ta depolama testi işletim sistemi önbelleğini atlar. Windows'ta bu
-yapılamadığı için okumalar kısmen bellekten yapılır ve gerçekte olduğundan hızlı ölçülür.
-Bunu dengelemek için **Windows'ta sıralı ve rastgele okuma puanları %30 düşürülür**
-(ölçülen değer olduğu gibi gösterilir, sadece puan düşer). Oran
-`pybench/engine.py` içindeki `WINDOWS_READ_PENALTY` ile ayarlanabilir.
+Okuma testleri işletim sisteminin dosya önbelleğini atlar, böylece RAM'den değil gerçekten
+diskten okunur: Windows'ta `FILE_FLAG_NO_BUFFERING`, macOS'ta `F_NOCACHE`, Linux'ta
+`posix_fadvise`. Önbellek herhangi bir nedenle atlanamazsa okumalar gerçek dışı hızlı
+ölçülür (testte Windows'ta rastgele okuma yazmanın 600 katı çıktı). Bu durumda okuma
+puanları **%30 düşürülür ve en fazla taban puan kadar** verilir; kartta bunun notu
+görünür. Oran `pybench/engine.py` içindeki `READ_CACHE_PENALTY` ile ayarlanabilir.
 
 ## Kaynak koddan çalıştırma
 

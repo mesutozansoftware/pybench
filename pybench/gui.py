@@ -414,7 +414,8 @@ class App:
         if extra.get("scaling"):
             card.note.config(text=f"{extra['threads']} iş parçacığı · {extra['scaling']:.1f}x çok çekirdek ölçekleme")
         if extra.get("penalty"):
-            card.note.config(text=f"Windows önbellek düzeltmesi: okuma puanları -%{extra['penalty'] * 100:.0f}")
+            card.note.config(text=f"Önbellek atlanamadı: okuma puanları -%{extra['penalty'] * 100:.0f} "
+                                  "ve en fazla taban puan")
         if extra.get("error"):
             card.note.config(text=f"GPU testi yapılamadı: {extra['error']}", fg=C["accent2"])
         elif extra.get("renderer"):

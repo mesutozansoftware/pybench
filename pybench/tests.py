@@ -192,6 +192,89 @@ def _drop_cache(fd):
             pass
 
 
+class _PosixReader:
+    """os.read ile okuma. macOS (F_NOCACHE) ve Linux'ta (fadvise) önbellek atlanır."""
+
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        self.uncached = sys.platform == "darwin" or hasattr(os, "posix_fadvise")
+        _no_cache(self.fd)
+        _drop_cache(self.fd)
+
+    def read(self, size):
+        return len(os.read(self.fd, size))
+
+    def read_at(self, offset, size):
+        os.lseek(self.fd, offset, os.SEEK_SET)
+        return self.read(size)
+
+    def close(self):
+        os.close(self.fd)
+
+
+class _WinUnbufferedReader:
+    """Windows: FILE_FLAG_NO_BUFFERING ile dosya önbelleğini atlayarak doğrudan diskten okur.
+
+    Bu kipte okuma boyutu ve konumu sektör boyutunun katı, tampon bellek de hizalı
+    olmalıdır; VirtualAlloc sayfa (4 KB) hizalı bellek verir.
+    """
+
+    uncached = True
+
+    def __init__(self, path, bufsize):
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                  wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k.CreateFileW.restype = wintypes.HANDLE
+        k.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                               ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k.ReadFile.restype = wintypes.BOOL
+        k.SetFilePointerEx.argtypes = [wintypes.HANDLE, ctypes.c_longlong, ctypes.c_void_p, wintypes.DWORD]
+        k.SetFilePointerEx.restype = wintypes.BOOL
+        k.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+        k.VirtualAlloc.restype = ctypes.c_void_p
+        k.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.k, self.ctypes, self.n = k, ctypes, wintypes.DWORD()
+
+        GENERIC_READ, SHARE_RW, OPEN_EXISTING, NO_BUFFERING = 0x80000000, 0x3, 3, 0x20000000
+        self.h = k.CreateFileW(path, GENERIC_READ, SHARE_RW, None, OPEN_EXISTING, NO_BUFFERING, None)
+        if self.h in (None, ctypes.c_void_p(-1).value):
+            raise OSError(ctypes.get_last_error(), "CreateFileW başarısız")
+        self.buf = k.VirtualAlloc(None, bufsize, 0x3000, 0x04)  # MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE
+        if not self.buf:
+            k.CloseHandle(self.h)
+            raise OSError(ctypes.get_last_error(), "VirtualAlloc başarısız")
+
+    def read(self, size):
+        if not self.k.ReadFile(self.h, self.buf, size, self.ctypes.byref(self.n), None):
+            raise OSError(self.ctypes.get_last_error(), "ReadFile başarısız")
+        return self.n.value
+
+    def read_at(self, offset, size):
+        if not self.k.SetFilePointerEx(self.h, offset, None, 0):
+            raise OSError(self.ctypes.get_last_error(), "SetFilePointerEx başarısız")
+        return self.read(size)
+
+    def close(self):
+        self.k.CloseHandle(self.h)
+        self.k.VirtualFree(self.buf, 0, 0x8000)  # MEM_RELEASE
+
+
+def _open_reader(path, bufsize):
+    if sys.platform == "win32":
+        try:
+            return _WinUnbufferedReader(path, bufsize)
+        except OSError:
+            pass
+    reader = _PosixReader(path)
+    if sys.platform == "win32":
+        reader.uncached = False  # önbellekli okuma: puan düzeltmesi uygulanacak
+    return reader
+
+
 def disk_all(budget, directory, size_mb=256):
     """Sıralı yazma/okuma ve rastgele 4K yazma/okuma. Geçici dosyayı sonunda siler."""
     path = os.path.join(directory, f"pybench_{os.getpid()}.tmp")
@@ -213,16 +296,15 @@ def disk_all(budget, directory, size_mb=256):
         finally:
             os.close(fd)
 
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        reader = _open_reader(path, len(block))
         try:
-            _no_cache(fd)
-            _drop_cache(fd)
+            res["read_uncached"] = reader.uncached
             t0 = time.perf_counter()
-            while os.read(fd, len(block)):
+            while reader.read(len(block)):
                 pass
             res["disk_seq_read"] = total_mb / (time.perf_counter() - t0)
         finally:
-            os.close(fd)
+            reader.close()
 
         blocks = count * len(block) // 4096
         rnd = random.Random(9)
@@ -241,18 +323,22 @@ def disk_all(budget, directory, size_mb=256):
                 ops += 32
             res["disk_rand_write"] = ops / (time.perf_counter() - t0)
             _drop_cache(fd)
+        finally:
+            os.close(fd)
 
+        reader = _open_reader(path, 4096)
+        try:
+            res["read_uncached"] = res["read_uncached"] and reader.uncached
             ops = 0
             t0 = time.perf_counter()
             deadline = t0 + budget
             while time.perf_counter() < deadline:
                 for _ in range(32):
-                    os.lseek(fd, rnd.randrange(blocks) * 4096, os.SEEK_SET)
-                    os.read(fd, 4096)
+                    reader.read_at(rnd.randrange(blocks) * 4096, 4096)
                 ops += 32
             res["disk_rand_read"] = ops / (time.perf_counter() - t0)
         finally:
-            os.close(fd)
+            reader.close()
     finally:
         try:
             os.remove(path)

@@ -10,7 +10,6 @@ import datetime
 import json
 import os
 import tempfile
-import sys
 import threading
 import time
 
@@ -53,9 +52,10 @@ TESTS = {t[0]: dict(id=t[0], cat=t[1], name=t[2], unit=t[3], ref=t[4], base=t[5]
 CATEGORY_BASE = {c: sum(t["base"] for t in TESTS.values() if t["cat"] == c) for c, _ in CATEGORIES}
 TOTAL_BASE = sum(CATEGORY_BASE.values())
 
-# Windows'ta depolama okuma testleri işletim sistemi önbelleğini atlayamaz ve gerçekte
-# olduğundan hızlı ölçülür. Bunu dengelemek için okuma puanları bu oranda düşürülür.
-WINDOWS_READ_PENALTY = 0.30
+# Okuma testleri normalde işletim sistemi önbelleğini atlar (Windows: FILE_FLAG_NO_BUFFERING,
+# macOS: F_NOCACHE, Linux: fadvise). Atlanamazsa okumalar bellekten yapılır ve gerçek dışı
+# hızlı ölçülür; o durumda okuma puanları bu oranda düşürülür ve taban puanla sınırlanır.
+READ_CACHE_PENALTY = 0.30
 READ_TESTS = ("disk_seq_read", "disk_rand_read")
 
 GPU_TESTS = ["gpu_alu", "gpu_fill", "gpu_texture", "gpu_geometry"]
@@ -88,13 +88,13 @@ class Cancelled(Exception):
     pass
 
 
-def score(test_id, value, platform=sys.platform):
+def score(test_id, value, cached_read=False):
     t = TESTS[test_id]
     if not t["ref"]:
         return 0
     pts = value / t["ref"] * t["base"]
-    if platform == "win32" and test_id in READ_TESTS:
-        pts *= 1 - WINDOWS_READ_PENALTY
+    if cached_read and test_id in READ_TESTS:
+        pts = min(pts * (1 - READ_CACHE_PENALTY), t["base"])
     return int(round(pts))
 
 
@@ -116,10 +116,12 @@ def run(sysinfo=None, quick=False, disk_dir=None, progress=None, on_result=None,
             raise Cancelled()
         if progress:
             progress(idx, len(STEPS), title)
+        cached = False
         if fn == "disk":
-            penalty = {"penalty": WINDOWS_READ_PENALTY} if sys.platform == "win32" else {}
-            values = {k: (v, penalty if k in READ_TESTS else {})
-                      for k, v in tests.disk_all(budget, disk_dir, disk_mb).items()}
+            out = tests.disk_all(budget, disk_dir, disk_mb)
+            cached = not out.pop("read_uncached", True)
+            note = {"penalty": READ_CACHE_PENALTY} if cached else {}
+            values = {k: (v, note if k in READ_TESTS else {}) for k, v in out.items()}
         elif fn == "gpu":
             out = gpu.gpu_all(budget)
             info = {k: out[k] for k in ("renderer", "gl_version", "software", "fps_1080p", "error") if k in out}
@@ -129,7 +131,7 @@ def run(sysinfo=None, quick=False, disk_dir=None, progress=None, on_result=None,
             value, extra = out if isinstance(out, tuple) else (out, {})
             values = {ids[0]: (value, extra)}
         for tid, (value, extra) in values.items():
-            pts = score(tid, value)
+            pts = score(tid, value, cached)
             results[tid] = {"value": value, "score": pts, "extra": extra}
             if on_result:
                 on_result(tid, value, pts, extra)
@@ -218,7 +220,7 @@ def report_text(result):
             if extra.get("scaling"):
                 lines.append(f"      {extra['threads']} iş parçacığı, {extra['scaling']:.1f}x ölçekleme")
             if extra.get("penalty"):
-                lines.append(f"      Windows önbellek düzeltmesi: puan -%{extra['penalty'] * 100:.0f}")
+                lines.append(f"      Önbellek atlanamadı: puan -%{extra['penalty'] * 100:.0f}, en fazla taban puan")
         if cat == "gpu":
             g = next((result["tests"][t].get("extra", {}) for t in GPU_TESTS if t in result["tests"]), {})
             if g.get("error"):

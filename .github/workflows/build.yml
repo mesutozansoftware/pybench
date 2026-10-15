@@ -69,6 +69,8 @@ jobs:
 
       - name: Derlenmiş uygulamanın sonucunu doğrula
         shell: bash
+        env:
+          PYTHONIOENCODING: utf-8
         run: |
           python -c "import json; r = json.load(open('smoke.json', encoding='utf-8')); print('Derlenmiş uygulama toplam puan:', r['total']); assert r['total'] > 0"
 
