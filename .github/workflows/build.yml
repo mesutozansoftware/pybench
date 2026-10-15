@@ -1,0 +1,96 @@
+name: Derle ve yayınla
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: PyBench-windows-x64.exe
+          - os: ubuntu-22.04
+            asset: PyBench-linux-x64.tar.gz
+          - os: macos-latest
+            asset: PyBench-macos-apple-silicon.zip
+          - os: macos-15-intel
+            asset: PyBench-macos-intel.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Bağımlılıkları kur
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Linux için sanal ekran ve yazılımsal OpenGL kur
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb libgl1-mesa-dri libegl1
+
+      - name: Kaynak koddan hızlı test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then RUN="xvfb-run -a"; fi
+          $RUN python main.py --cli --quick
+
+      - name: Bağımsız uygulamayı derle
+        run: python build.py
+
+      - name: Paketle (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Move-Item dist/PyBench.exe ${{ matrix.asset }}
+          ./${{ matrix.asset }} --cli --quick --json smoke.json | Out-Default
+
+      - name: Paketle (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          dist/PyBench.app/Contents/MacOS/PyBench --cli --quick --json smoke.json > /dev/null
+          ditto -c -k --keepParent dist/PyBench.app ${{ matrix.asset }}
+
+      - name: Paketle (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run -a dist/PyBench --cli --quick --json smoke.json > /dev/null
+          tar -czf ${{ matrix.asset }} -C dist PyBench
+
+      - name: Derlenmiş uygulamanın sonucunu doğrula
+        shell: bash
+        run: |
+          python -c "import json; r = json.load(open('smoke.json', encoding='utf-8')); print('Derlenmiş uygulama toplam puan:', r['total']); assert r['total'] > 0"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: GitHub sürümü oluştur
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --title "PyBench $GITHUB_REF_NAME" \
+            --notes-file .github/release-notes.md
